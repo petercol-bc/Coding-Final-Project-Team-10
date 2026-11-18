@@ -3,6 +3,7 @@ import json
 import student_auth
 import time
 import random
+import re
 import FreeSimpleGUI as sg
 
 
@@ -96,18 +97,91 @@ def decide_hack_coordinates(opponent_grid_view=None, locally_hacked=None):
             available.append(coord)
     return random.choice(available) if available else None
 
+def _cells_for(row, col, length, horizontal):
+    if horizontal:
+        return [(row, col + i) for i in range(length)]
+    return [(row + i, col) for i in range(length)]
+
+
+def _to_coord(row, col):
+    return f"{chr(ord('A') + row)}{col + 1}"
+
+
+def _random_layout(keep_gap):
+    """Try to randomly place all buildings. Returns a dict, or None if it got stuck.
+    keep_gap=True also stops buildings from touching, so hitting one
+    doesn't give the opponent clues about its neighbors."""
+    occupied = set()
+    layout = {asset_type: [] for asset_type in CLIENT_ASSET_CONFIG}
+    for asset_type, cfg in CLIENT_ASSET_CONFIG.items():  # largest first
+        size = cfg['size']
+        for _ in range(cfg['count']):
+            for _attempt in range(200):
+                horizontal = random.choice([True, False])
+                row = random.randrange(GRID_SIZE if horizontal else GRID_SIZE - size + 1)
+                col = random.randrange(GRID_SIZE - size + 1 if horizontal else GRID_SIZE)
+                cells = _cells_for(row, col, size, horizontal)
+                if any(c in occupied for c in cells):
+                    continue
+                if keep_gap and any((r + dr, c + dc) in occupied
+                                    for r, c in cells
+                                    for dr in (-1, 0, 1) for dc in (-1, 0, 1)):
+                    continue
+                occupied.update(cells)
+                layout[asset_type].append([_to_coord(r, c) for r, c in cells])
+                break
+            else:
+                return None
+    return layout
+
+
+def validate_placement(assets):
+    """Return True only if the layout follows every placement rule."""
+    try:
+        if set(assets.keys()) != set(CLIENT_ASSET_CONFIG.keys()):
+            return False
+        seen = set()
+        for asset_type, cfg in CLIENT_ASSET_CONFIG.items():
+            buildings = assets[asset_type]
+            if not isinstance(buildings, list) or len(buildings) != cfg['count']:
+                return False
+            for building in buildings:
+                if len(building) != cfg['size']:
+                    return False
+                points = []
+                for coord in building:
+                    if not re.fullmatch(r'[A-J](10|[1-9])', coord) or coord in seen:
+                        return False
+                    seen.add(coord)
+                    points.append((ord(coord[0]) - 65, int(coord[1:]) - 1))
+                rows = {p[0] for p in points}
+                cols = {p[1] for p in points}
+                if len(rows) == 1:
+                    line = sorted(cols)
+                elif len(cols) == 1:
+                    line = sorted(rows)
+                else:
+                    return False  # diagonal or scattered
+                if line != list(range(line[0], line[0] + len(line))):
+                    return False  # gaps
+        return True
+    except Exception:
+        return False
+
 
 def decide_asset_placement():
-    """Determines where in grid to place assets and returns a dictionary."""
-
-    # Students: This is where you generate random asset locations.
-    # For now, return something valid.
+    """Randomly place 1 HQ, 2 warehouses, 3 stores: valid, non-overlapping,
+    and (when possible) not touching each other."""
+    for attempt in range(2000):
+        layout = _random_layout(keep_gap=attempt < 1500)
+        if layout and validate_placement(layout):
+            return layout
+    # Safety net: known-valid layout
     return {
         "hq": [["B2", "C2", "D2", "E2", "F2"]],
         "warehouse": [["E8", "E9", "E10"], ["H4", "I4", "J4"]],
         "store": [["G6", "G7"], ["A8", "A9"], ["C4", "D4"]]
     }
-
 
 # --- API Interaction Stubs ---
 
@@ -129,15 +203,25 @@ def do_join(server_url, team_id, opponent_id=None):
     return None
 
 
+_placed_games = set()
+
+
 def do_place_assets(server_url, game_id, team_id, placements_data=None):
-    """POST /{game_id}/place-assets; return True only on success."""
+    """POST /{game_id}/place-assets; return True only on success. Places once per game."""
+    if game_id in _placed_games:
+        print("Assets already placed for this game; skipping.")
+        return True
     if placements_data is None:
         placements_data = decide_asset_placement()
+    if not validate_placement(placements_data):
+        print("Placement failed local validation; not sending.")
+        return False
     url = f"{server_url.rstrip('/')}/{game_id}/place-assets"
     payload = {"team_id": team_id, "assets": placements_data}
     try:
         response = student_auth.post(url, data=payload)
         if response.status_code in (200, 201):
+            _placed_games.add(game_id)
             print("Assets placed successfully.")
             return True
         handle_api_error(response)
@@ -323,64 +407,115 @@ def main():
         locally_hacked = set()
         opponent_attacks = set()
         last_hack_text = "none"
-        previous_status = None
         next_poll = 0.0
         finished = False
+        status_failures = 0
+        hack_failures = 0
+        last_hacked_turn = None
+        autoplay_announced = False
+        POLL_INTERVAL = 2.0
+        MAX_STATUS_FAILURES = 10
+        MAX_HACK_FAILURES = 3
 
-        # The window.read loop keeps the GUI responsive. Status polling happens
-        # every 2 seconds without blocking GUI events with time.sleep().
         while True:
             event, _ = window.read(timeout=GAME_LOOP_TIMEOUT_MS)
             if event in (sg.WIN_CLOSED, "-EXIT-"):
                 break
             if finished or time.monotonic() < next_poll:
                 continue
-            next_poll = time.monotonic() + 2.0
+            next_poll = time.monotonic() + POLL_INTERVAL
+
             status = do_get_status(server_url, game_id, args.team_id)
             if status is None:
-                # Transient error: try again, not a blind attack.
+                status_failures += 1
+                window['-STATE-'].update(
+                    f"Connection problem ({status_failures}/{MAX_STATUS_FAILURES}), retrying...")
+                if status_failures >= MAX_STATUS_FAILURES:
+                    window['-STATE-'].update("Lost contact with Game Server. Close and restart.")
+                    print("Too many failed status requests; stopping.")
+                    finished = True
                 continue
-            previous_status = status
+            status_failures = 0
+
             state = status.get('game_state', 'unknown')
             my_turn = status.get('is_your_turn', False)
+            turn = status.get('turn_count')
             stats = status.get('your_stats') or {}
             damage = float(stats.get('total_damage_inflicted', 0))
             penalties = float(stats.get('penalties', 0))
+            goofs = int(stats.get('goof_count', 0))
+            on_autoplay = bool(stats.get('on_autoplay', False))
             net_damage = max(0, damage - penalties)
             opponent_grid = status.get('opponent_grid_view')
             opponent_move = status.get('last_opponent_move')
-            window['-STATE-'].update(f"Game status: {state} | " +
-                                    ('Your turn' if my_turn else "Opponent's turn"))
+
+            # --- Dashboard updates (Member 3's widgets) ---
+            if state == 'waiting':
+                state_text = "Waiting for opponent to join..."
+            elif on_autoplay:
+                state_text = "AUTOPLAY: server is playing for us"
+            else:
+                state_text = f"Game status: {state} | " + ("Your turn" if my_turn else "Opponent's turn")
+            window['-STATE-'].update(state_text)
             window['-DAMAGE-'].update(f"Net damage: ${net_damage:,.0f} / $750,000")
             window['-PROGRESS-'].update(current_count=min(750000, int(net_damage)))
             window['-STATS-'].update(
-                f"Turns (server): {status.get('turn_count', 0)}   "
-                f"Penalties: ${penalties:,.0f}   Goofs: {stats.get('goof_count', 0)}"
-            )
+                f"Turns (server): {turn}   Penalties: ${penalties:,.0f}   Goofs: {goofs}/5")
             window['-OWN-'].update(display_own_grid(assets, opponent_move, opponent_attacks))
             window['-OPP-'].update(display_grid(opponent_grid))
             window['-LAST-HACK-'].update(f"Last hack: {last_hack_text}")
             if opponent_move:
                 window['-OPP-MOVE-'].update(
                     f"Opponent's last move: {opponent_move.get('coords')} "
-                    f"({opponent_move.get('result')})"
-                )
+                    f"({opponent_move.get('result')})")
+
+            # --- Autoplay ---
+            if on_autoplay and not autoplay_announced:
+                print(f"Autoplay triggered (goofs: {goofs}). Our requests are now ignored.")
+                autoplay_announced = True
+
+            # --- Game over ---
             if state == 'finished':
                 winner = status.get('winner')
-                window['-STATE-'].update(f"GAME OVER | Winner: {winner}")
+                if winner == 'DRAW':
+                    result_text = "GAME OVER: DRAW"
+                elif winner == args.team_id:
+                    result_text = "GAME OVER: YOU WON!"
+                else:
+                    result_text = f"GAME OVER: {winner} won"
+                window['-STATE-'].update(result_text)
+                print(result_text)
+                print(f"Final net damage: ${net_damage:,.0f} | Penalties: ${penalties:,.0f} | Goofs: {goofs}")
                 finished = True
                 continue
-            if state == 'active' and my_turn and not stats.get('on_autoplay', False):
-                coord = decide_hack_coordinates(opponent_grid, locally_hacked)
-                if coord is not None:
-                    result = do_hack(server_url, game_id, args.team_id, coord)
-                    if result is not None:
-                        locally_hacked.add(coord)
-                        last_hack_text = (f"{coord}: {result.get('result', '?')} "
-                                          f"(${result.get('damage_inflicted', 0):,})")
-                        window['-LAST-HACK-'].update(f"Last hack: {last_hack_text}")
-        window.close()
 
+            # --- Waiting for opponent: do nothing but keep polling ---
+            if state != 'active':
+                continue
+
+            # --- Our turn: pick a cell and hack ---
+            if my_turn and not on_autoplay and turn != last_hacked_turn:
+                coord = decide_hack_coordinates(opponent_grid, locally_hacked)
+                if coord is None:
+                    print("No unhacked cells left.")
+                    continue
+                result = do_hack(server_url, game_id, args.team_id, coord)
+                if result is not None:
+                    locally_hacked.add(coord)
+                    last_hacked_turn = turn      # don't hack again this turn
+                    hack_failures = 0
+                    last_hack_text = (f"{coord}: {result.get('result', '?')} "
+                                      f"(${result.get('damage_inflicted', 0):,})")
+                    window['-LAST-HACK-'].update(f"Last hack: {last_hack_text}")
+                else:
+                    hack_failures += 1
+                    locally_hacked.add(coord)    # never retry a cell that errored
+                    if hack_failures >= MAX_HACK_FAILURES:
+                        print("Hack failed repeatedly; letting the server move for us this turn.")
+                        last_hacked_turn = turn
+                        hack_failures = 0
+
+        window.close()
 
 if __name__ == "__main__":
     main()
